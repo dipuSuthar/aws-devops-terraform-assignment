@@ -1,0 +1,88 @@
+name: Terraform Deploy
+
+on:
+  pull_request:
+    paths: ["terraform/**", "app/**"]
+  push:
+    branches: [main]
+    paths: ["terraform/**", "app/**"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC to AWS (no long-lived keys)
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+  TF_IN_AUTOMATION: "true"
+
+defaults:
+  run:
+    working-directory: terraform
+
+jobs:
+  plan:
+    name: Validate & Plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - run: terraform fmt -check -recursive
+      - run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=devops-task/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+      - run: terraform validate
+      - run: terraform plan -out=tfplan -input=false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+
+  apply:
+    name: Apply & Verify
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production   # add required reviewers in repo settings for manual approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+      - run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=devops-task/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+      - run: terraform apply -auto-approve -input=false
+      - name: Health check (HTTPS + DB)
+        run: |
+          URL=$(terraform output -raw app_url)
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || true)
+            echo "attempt $i: $code"
+            [ "$code" = "200" ] && break
+            sleep 20
+          done
+          [ "$code" = "200" ] || { echo "health check failed"; exit 1; }
+          curl -fsS "$URL/health/db"
+          # HTTP must redirect to HTTPS
+          curl -s -o /dev/null -w "%{http_code} -> %{redirect_url}\n" "http://${URL#https://}/"
